@@ -1,0 +1,766 @@
+{
+  "meta": {
+    "instanceId": "gensyn-auto-discovery"
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "/webhook/gensyn/register",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "vps-registration-webhook",
+      "name": "VPS Registration Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 200],
+      "webhookId": "gensyn-register-webhook"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "/webhook/gensyn/status",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "vps-status-webhook",
+      "name": "VPS Status Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 400],
+      "webhookId": "gensyn-status-webhook"
+    },
+    {
+      "parameters": {
+        "authentication": "accessToken",
+        "accessToken": "={{ $env.TELEGRAM_BOT_TOKEN }}",
+        "updates": ["message", "callback_query"]
+      },
+      "id": "telegram-trigger",
+      "name": "Telegram Bot",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1,
+      "position": [240, 700]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Auto-Discovery VPS Registration Handler\nconst payload = $input.all()[0].json;\n\n// Extract registration data\nconst vpsData = {\n  vps_id: payload.vps_id,\n  vps_name: payload.vps_name,\n  vps_uuid: payload.vps_uuid,\n  auth_token: payload.auth_token,\n  webhook_url: payload.webhook_url,\n  system_info: payload.system_info || {},\n  capabilities: payload.capabilities || {},\n  setup_time: payload.setup_time,\n  registration_time: new Date().toISOString(),\n  public_ip: payload.data?.public_ip || 'unknown',\n  status: 'pending_approval',\n  last_heartbeat: new Date().toISOString(),\n  registration_attempt: payload.data?.registration_attempt || 1\n};\n\n// Get existing VPS registry\nconst workflowStaticData = this.getWorkflowStaticData('global');\nif (!workflowStaticData.vpsRegistry) {\n  workflowStaticData.vpsRegistry = {};\n}\n\nconst existingVps = workflowStaticData.vpsRegistry[vpsData.vps_id];\nlet action = 'new_registration';\nlet autoApprove = false;\n\n// Check if this is a re-registration of existing VPS\nif (existingVps) {\n  if (existingVps.vps_uuid === vpsData.vps_uuid) {\n    // Same VPS re-registering (probably restarted)\n    action = 're_registration';\n    autoApprove = true;\n    vpsData.status = 'approved';\n    vpsData.approval_time = new Date().toISOString();\n  } else {\n    // Different VPS with same ID - needs manual approval\n    action = 'duplicate_id';\n    vpsData.status = 'duplicate_id_detected';\n  }\n} else {\n  // New VPS - check auto-approval settings\n  const autoApprovalEnabled = $env.AUTO_APPROVE_VPS === 'true';\n  if (autoApprovalEnabled) {\n    autoApprove = true;\n    vpsData.status = 'approved';\n    vpsData.approval_time = new Date().toISOString();\n    action = 'auto_approved';\n  }\n}\n\n// Store/update VPS in registry\nworkflowStaticData.vpsRegistry[vpsData.vps_id] = vpsData;\n\n// Prepare response\nconst response = {\n  status: vpsData.status,\n  message: action === 're_registration' ? 'Re-registration successful' :\n           action === 'auto_approved' ? 'Auto-approved and registered' :\n           action === 'duplicate_id' ? 'Duplicate VPS ID detected - admin approval required' :\n           'Registration received - pending admin approval',\n  vps_id: vpsData.vps_id,\n  admin_chat_id: $env.ADMIN_CHAT_ID,\n  auto_approved: autoApprove\n};\n\nreturn {\n  json: {\n    vps_data: vpsData,\n    response: response,\n    action: action,\n    auto_approved: autoApprove,\n    should_notify_admin: !autoApprove || action === 'duplicate_id'\n  }\n};"
+      },
+      "id": "process-registration",
+      "name": "Process VPS Registration",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "should_notify",
+              "leftValue": "={{ $json.should_notify_admin }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equal"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "should-notify-admin",
+      "name": "Should Notify Admin?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 200]
+    },
+    {
+      "parameters": {
+        "authentication": "accessToken",
+        "accessToken": "={{ $env.TELEGRAM_BOT_TOKEN }}",
+        "chatId": "={{ $env.ADMIN_CHAT_ID }}",
+        "text": "🤖 *New VPS Registration*\\n\\n**VPS Details:**\\n• Name: {{ $json.vps_data.vps_name }}\\n• ID: `{{ $json.vps_data.vps_id }}`\\n• IP: {{ $json.vps_data.public_ip }}\\n• System: {{ $json.vps_data.system_info.os }} {{ $json.vps_data.system_info.architecture }}\\n• CPU Cores: {{ $json.vps_data.system_info.cpu_cores }}\\n• Memory: {{ $json.vps_data.system_info.total_memory_gb }}GB\\n\\n**Capabilities:**\\n• Gensyn: {{ $json.vps_data.capabilities.gensyn ? '✅' : '❌' }}\\n• VPN: {{ $json.vps_data.capabilities.vpn ? '✅' : '❌' }}\\n• Auto-Discovery: ✅\\n\\n**Status:** {{ $json.action === 'auto_approved' ? '✅ Auto-Approved' : '⏳ Pending Approval' }}\\n\\n{{ $json.action === 'duplicate_id' ? '⚠️ **Warning:** Duplicate VPS ID detected!' : '' }}",
+        "additionalFields": {
+          "parse_mode": "Markdown",
+          "reply_markup": {
+            "inline_keyboard": [
+              [
+                {
+                  "text": "✅ Approve",
+                  "callback_data": "approve_vps_{{ $json.vps_data.vps_id }}"
+                },
+                {
+                  "text": "❌ Reject",
+                  "callback_data": "reject_vps_{{ $json.vps_data.vps_id }}"
+                }
+              ],
+              [
+                {
+                  "text": "📋 View All VPSs",
+                  "callback_data": "admin_vps_list"
+                }
+              ]
+            ]
+          }
+        }
+      },
+      "id": "notify-admin-registration",
+      "name": "Notify Admin of Registration",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [900, 140]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          }
+        }
+      },
+      "id": "registration-response",
+      "name": "Registration Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [900, 260]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process VPS Status Updates with Auto-Discovery\nconst payload = $input.all()[0].json;\nconst workflowStaticData = this.getWorkflowStaticData('global');\n\n// Ensure VPS registry exists\nif (!workflowStaticData.vpsRegistry) {\n  workflowStaticData.vpsRegistry = {};\n}\n\nconst vpsId = payload.vps_id;\nconst messageType = payload.message_type;\n\n// Check if VPS is registered\nconst vpsData = workflowStaticData.vpsRegistry[vpsId];\nif (!vpsData) {\n  return {\n    json: {\n      error: 'VPS not registered',\n      vps_id: vpsId,\n      action: 'registration_required'\n    }\n  };\n}\n\n// Validate auth token\nif (vpsData.auth_token !== payload.auth_token) {\n  return {\n    json: {\n      error: 'Invalid authentication token',\n      vps_id: vpsId,\n      action: 'auth_failed'\n    }\n  };\n}\n\n// Update VPS data based on message type\nconst now = new Date().toISOString();\nvpsData.last_heartbeat = payload.timestamp || now;\nvpsData.status = 'online';\n\nlet action = 'processed';\nlet shouldAlert = false;\nlet alertMessage = '';\n\nswitch (messageType) {\n  case 'heartbeat':\n    action = 'heartbeat_received';\n    vpsData.system_metrics = payload.data?.system_info || {};\n    vpsData.uptime = payload.data?.uptime;\n    break;\n    \n  case 'notification':\n    action = 'notification_received';\n    if (payload.data?.priority === 'high') {\n      shouldAlert = true;\n      alertMessage = `🚨 ${vpsData.vps_name}: ${payload.data.message}`;\n    }\n    break;\n    \n  case 'vps_registration':\n    action = 'registration_update';\n    // Update registration data\n    Object.assign(vpsData, {\n      system_info: payload.system_info || vpsData.system_info,\n      capabilities: payload.capabilities || vpsData.capabilities,\n      webhook_url: payload.webhook_url || vpsData.webhook_url,\n      public_ip: payload.data?.public_ip || vpsData.public_ip\n    });\n    break;\n    \n  case 'status_update':\n    action = 'status_updated';\n    vpsData.last_status = payload.data;\n    break;\n    \n  case 'reward_update':\n    action = 'reward_received';\n    shouldAlert = true;\n    alertMessage = `💰 ${vpsData.vps_name}: ${payload.data?.message || 'Reward update'}`;\n    break;\n    \n  case 'error_alert':\n    action = 'error_received';\n    shouldAlert = true;\n    alertMessage = `❌ ${vpsData.vps_name}: ${payload.data?.error_message || 'Error occurred'}`;\n    break;\n    \n  case 'vps_offline':\n    action = 'vps_offline';\n    vpsData.status = 'offline';\n    vpsData.offline_reason = payload.data?.reason || 'unknown';\n    shouldAlert = true;\n    alertMessage = `📴 ${vpsData.vps_name} went offline`;\n    break;\n}\n\n// Update registry\nworkflowStaticData.vpsRegistry[vpsId] = vpsData;\n\nreturn {\n  json: {\n    vps_id: vpsId,\n    vps_name: vpsData.vps_name,\n    action: action,\n    message_type: messageType,\n    should_alert: shouldAlert,\n    alert_message: alertMessage,\n    vps_status: vpsData.status,\n    processed_at: now\n  }\n};"
+      },
+      "id": "process-status-update",
+      "name": "Process Status Update",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "should_alert",
+              "leftValue": "={{ $json.should_alert }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equal"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "should-alert-status",
+      "name": "Should Alert Status?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 400]
+    },
+    {
+      "parameters": {
+        "authentication": "accessToken",
+        "accessToken": "={{ $env.TELEGRAM_BOT_TOKEN }}",
+        "chatId": "={{ $env.ADMIN_CHAT_ID }}",
+        "text": "{{ $json.alert_message }}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "send-status-alert",
+      "name": "Send Status Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [900, 360]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"status\": \"success\", \"action\": \"{{ $json.action }}\"}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          }
+        }
+      },
+      "id": "status-response",
+      "name": "Status Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [900, 440]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Enhanced Telegram Input Processing with Auto-Discovery\nconst input = $input.all()[0].json;\nconst workflowStaticData = this.getWorkflowStaticData('global');\n\n// Ensure VPS registry exists\nif (!workflowStaticData.vpsRegistry) {\n  workflowStaticData.vpsRegistry = {};\n}\n\nconst vpsRegistry = workflowStaticData.vpsRegistry;\nconst isCallback = input.callback_query !== undefined;\nconst isMessage = input.message !== undefined;\n\nlet chatId, messageText, callbackData, userId;\n\nif (isCallback) {\n  chatId = input.callback_query.message.chat.id;\n  callbackData = input.callback_query.data;\n  userId = input.callback_query.from.id;\n  messageText = callbackData;\n} else if (isMessage) {\n  chatId = input.message.chat.id;\n  messageText = input.message.text;\n  userId = input.message.from.id;\n}\n\n// Parse command/action\nlet action = 'unknown';\nlet selectedVps = null;\nlet command = null;\nlet adminAction = null;\n\nif (messageText) {\n  if (messageText === '/start' || messageText === '/vpses') {\n    action = 'show_vps_list';\n  } else if (messageText === '/help') {\n    action = 'show_help';\n  } else if (messageText === '/admin' && userId.toString() === $env.ADMIN_CHAT_ID) {\n    action = 'admin_panel';\n  } else if (messageText.startsWith('select_vps_')) {\n    action = 'vps_selected';\n    selectedVps = messageText.replace('select_vps_', '');\n  } else if (messageText.startsWith('cmd_')) {\n    const parts = messageText.split('_');\n    if (parts.length >= 3) {\n      action = 'execute_command';\n      selectedVps = parts[1];\n      command = parts.slice(2).join('_');\n    }\n  } else if (messageText.startsWith('approve_vps_')) {\n    action = 'admin_approve_vps';\n    selectedVps = messageText.replace('approve_vps_', '');\n  } else if (messageText.startsWith('reject_vps_')) {\n    action = 'admin_reject_vps';\n    selectedVps = messageText.replace('reject_vps_', '');\n  } else if (messageText === 'admin_vps_list') {\n    action = 'admin_vps_list';\n  } else if (messageText === 'back_to_vps_list' || messageText === 'refresh_vps_list') {\n    action = 'show_vps_list';\n  }\n}\n\n// Generate VPS list (only approved VPSs for regular users)\nconst allVpses = Object.entries(vpsRegistry).map(([id, data]) => {\n  const lastSeen = data.last_heartbeat ? new Date(data.last_heartbeat) : null;\n  const timeDiff = lastSeen ? Math.floor((Date.now() - lastSeen.getTime()) / 1000 / 60) : 999;\n  const isOnline = data.status === 'online' || (data.status === 'approved' && timeDiff < 10);\n  \n  return {\n    id: id,\n    name: data.vps_name,\n    status: isOnline ? '🟢' : '🔴',\n    display: `${isOnline ? '🟢' : '🔴'} ${data.vps_name} (${timeDiff < 999 ? timeDiff + 'm ago' : 'offline'})`,\n    online: isOnline,\n    last_seen_minutes: timeDiff,\n    approval_status: data.status,\n    system_info: data.system_info || {},\n    capabilities: data.capabilities || {}\n  };\n});\n\n// Filter VPSs based on user permissions\nconst isAdmin = userId.toString() === $env.ADMIN_CHAT_ID;\nconst vpsArray = allVpses.filter(vps => \n  isAdmin || vps.approval_status === 'approved'\n).sort((a, b) => a.name.localeCompare(b.name));\n\nreturn {\n  json: {\n    action: action,\n    chat_id: chatId,\n    user_id: userId,\n    is_admin: isAdmin,\n    message_text: messageText,\n    selected_vps: selectedVps,\n    command: command,\n    vps_list: vpsArray,\n    all_vpses: allVpses,\n    callback_data: callbackData,\n    is_callback: isCallback,\n    total_vpses: allVpses.length,\n    approved_vpses: vpsArray.length,\n    pending_vpses: allVpses.filter(v => v.approval_status === 'pending_approval').length\n  }\n};"
+      },
+      "id": "process-telegram-input",
+      "name": "Process Telegram Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 700]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "show_vps_list",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "show_vps_list",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "vps_selected",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "vps_selected",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "execute_command",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "execute_command",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "show_help",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "show_help",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "admin_actions",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "admin_approve_vps",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "admin_actions2",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "admin_reject_vps",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "admin_panel",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "admin_panel",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "admin_vps_list",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "admin_vps_list",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "id": "telegram-action-router",
+      "name": "Telegram Action Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [680, 700]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Generate Auto-Discovery VPS Menu\nconst input = $input.all()[0].json;\nconst vpsList = input.vps_list;\nconst isAdmin = input.is_admin;\n\nif (vpsList.length === 0) {\n  const adminNote = isAdmin ? \"\\n\\n🔧 *Admin Note:* No approved VPSs. Check pending registrations with /admin\" : \"\";\n  \n  return {\n    json: {\n      chat_id: input.chat_id,\n      message: `🤖 *Gensyn Auto-Discovery Manager*\\n\\n❌ No VPSs currently available.${adminNote}\\n\\n📋 *Quick Setup:*\\n1. Run \\`python3 auto_setup.py\\` on any VPS\\n2. Provide this server's URL\\n3. VPS will auto-register and appear here!`,\n      parse_mode: \"Markdown\",\n      reply_markup: {\n        inline_keyboard: [\n          [{ text: \"🔄 Refresh\", callback_data: \"refresh_vps_list\" }],\n          isAdmin ? [{ text: \"⚙️ Admin Panel\", callback_data: \"admin_panel\" }] : []\n        ].filter(row => row.length > 0)\n      }\n    }\n  };\n}\n\n// Create inline keyboard with VPS options\nconst keyboard = vpsList.map(vps => [{\n  text: vps.display,\n  callback_data: `select_vps_${vps.id}`\n}]);\n\n// Add control buttons\nconst controlButtons = [\n  [{ text: \"🔄 Refresh\", callback_data: \"refresh_vps_list\" }]\n];\n\nif (isAdmin && input.pending_vpses > 0) {\n  controlButtons.push([{ text: `⚙️ Admin Panel (${input.pending_vpses} pending)`, callback_data: \"admin_panel\" }]);\n} else if (isAdmin) {\n  controlButtons.push([{ text: \"⚙️ Admin Panel\", callback_data: \"admin_panel\" }]);\n}\n\nkeyboard.push(...controlButtons);\n\nconst onlineVpses = vpsList.filter(v => v.online).length;\nconst statusText = `📊 Status: ${onlineVpses}/${vpsList.length} VPSs online`;\nconst pendingText = input.pending_vpses > 0 ? `\\n⏳ ${input.pending_vpses} pending approval` : \"\";\n\nreturn {\n  json: {\n    chat_id: input.chat_id,\n    message: `🤖 *Gensyn Auto-Discovery Manager*\\n\\n${statusText}${pendingText}\\n\\n🖥️ Select a VPS to manage:`,\n    parse_mode: \"Markdown\",\n    reply_markup: {\n      inline_keyboard: keyboard\n    },\n    edit_message: input.is_callback\n  }\n};"
+      },
+      "id": "generate-auto-vps-menu",
+      "name": "Generate Auto VPS Menu",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 600]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Generate Enhanced VPS Controls with Auto-Discovery Info\nconst input = $input.all()[0].json;\nconst vpsId = input.selected_vps;\nconst vpsList = input.vps_list;\n\n// Find the selected VPS\nconst selectedVps = vpsList.find(v => v.id === vpsId);\n\nif (!selectedVps) {\n  return {\n    json: {\n      chat_id: input.chat_id,\n      message: \"❌ VPS not found or no longer available.\",\n      reply_markup: {\n        inline_keyboard: [[\n          { text: \"⬅️ Back to VPS List\", callback_data: \"show_vps_list\" }\n        ]]\n      }\n    }\n  };\n}\n\n// Get detailed VPS info from registry\nconst workflowStaticData = this.getWorkflowStaticData('global');\nconst vpsData = workflowStaticData.vpsRegistry[vpsId] || {};\n\n// Build status info\nconst statusIcon = selectedVps.online ? '🟢' : '🔴';\nconst statusText = selectedVps.online ? 'Online' : 'Offline';\nconst lastSeen = selectedVps.last_seen_minutes < 999 ? `${selectedVps.last_seen_minutes}m ago` : 'unknown';\n\n// System info if available\nlet systemInfo = '';\nif (vpsData.system_metrics && Object.keys(vpsData.system_metrics).length > 0) {\n  const sys = vpsData.system_metrics;\n  systemInfo = `\\n💻 CPU: ${sys.cpu_percent || '?'}% | RAM: ${sys.memory_percent || '?'}% | Disk: ${sys.disk_percent || '?'}%`;\n} else if (vpsData.system_info && Object.keys(vpsData.system_info).length > 0) {\n  const sys = vpsData.system_info;\n  systemInfo = `\\n💻 ${sys.os} | ${sys.cpu_cores} cores | ${sys.total_memory_gb}GB RAM`;\n}\n\n// Capabilities info\nlet capabilitiesInfo = '';\nif (vpsData.capabilities) {\n  const caps = vpsData.capabilities;\n  const gensyn = caps.gensyn ? '✅' : '❌';\n  const vpn = caps.vpn ? '✅' : '❌';\n  capabilitiesInfo = `\\n🎯 Gensyn: ${gensyn} | VPN: ${vpn} | Auto-Discovery: ✅`;\n}\n\n// Create command buttons based on capabilities\nconst keyboard = [\n  [\n    { text: \"📊 Status\", callback_data: `cmd_${vpsId}_system_status` },\n    { text: \"🌐 Check IP\", callback_data: `cmd_${vpsId}_check_ip` }\n  ]\n];\n\n// Add Gensyn controls if supported\nif (vpsData.capabilities?.gensyn) {\n  keyboard.push([\n    { text: \"📈 Gensyn Status\", callback_data: `cmd_${vpsId}_gensyn_status` },\n    { text: \"▶️ Start Gensyn\", callback_data: `cmd_${vpsId}_start_gensyn` }\n  ]);\n  keyboard.push([\n    { text: \"⏹️ Stop Gensyn\", callback_data: `cmd_${vpsId}_kill_gensyn` },\n    { text: \"🔄 Restart\", callback_data: `cmd_${vpsId}_restart_services` }\n  ]);\n}\n\n// Add VPN controls if supported\nif (vpsData.capabilities?.vpn) {\n  keyboard.push([\n    { text: \"🔒 VPN On\", callback_data: `cmd_${vpsId}_vpn_on` },\n    { text: \"🔓 VPN Off\", callback_data: `cmd_${vpsId}_vpn_off` }\n  ]);\n}\n\n// Add utility commands\nkeyboard.push([\n  { text: \"📋 Logs\", callback_data: `cmd_${vpsId}_get_logs` },\n  { text: \"🔄 Update\", callback_data: `cmd_${vpsId}_soft_update` }\n]);\n\n// Navigation\nkeyboard.push([\n  { text: \"⬅️ Back to VPS List\", callback_data: \"show_vps_list\" }\n]);\n\nreturn {\n  json: {\n    chat_id: input.chat_id,\n    message: `🖥️ *${selectedVps.name} Management*\\n\\n📊 Status: ${statusIcon} ${statusText} (${lastSeen})${systemInfo}${capabilitiesInfo}\\n\\n🎛️ Choose an action:`,\n    parse_mode: \"Markdown\",\n    reply_markup: {\n      inline_keyboard: keyboard\n    },\n    edit_message: input.is_callback\n  }\n};"
+      },
+      "id": "generate-enhanced-vps-controls",
+      "name": "Generate Enhanced VPS Controls",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 700]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Auto-Discovery Command Router\nconst input = $input.all()[0].json;\nconst vpsId = input.selected_vps;\nconst command = input.command;\n\n// Get VPS configuration from registry\nconst workflowStaticData = this.getWorkflowStaticData('global');\nconst vpsRegistry = workflowStaticData.vpsRegistry || {};\nconst vpsData = vpsRegistry[vpsId];\n\nif (!vpsData) {\n  return {\n    json: {\n      error: `VPS ${vpsId} not found in registry`,\n      chat_id: input.chat_id,\n      vps_id: vpsId\n    }\n  };\n}\n\nif (vpsData.status !== 'approved') {\n  return {\n    json: {\n      error: `VPS ${vpsId} is not approved (status: ${vpsData.status})`,\n      chat_id: input.chat_id,\n      vps_id: vpsId\n    }\n  };\n}\n\n// Prepare command parameters based on command type\nlet parameters = {};\nswitch (command) {\n  case 'get_logs':\n    parameters = { log_type: 'gensyn', lines: 20 };\n    break;\n  case 'start_gensyn':\n    parameters = { use_sync_backup: true, fresh_start: false };\n    break;\n  case 'restart_services':\n    parameters = { service: 'all' };\n    break;\n  case 'system_status':\n    parameters = { detailed: true };\n    break;\n}\n\n// Prepare command payload\nconst commandPayload = {\n  command: command,\n  parameters: parameters,\n  auth_token: vpsData.auth_token,\n  timestamp: new Date().toISOString(),\n  request_id: `${vpsId}-${Date.now()}`\n};\n\nreturn {\n  json: {\n    ...commandPayload,\n    webhook_url: vpsData.webhook_url,\n    chat_id: input.chat_id,\n    vps_id: vpsId,\n    vps_name: vpsData.vps_name\n  }\n};"
+      },
+      "id": "auto-route-command",
+      "name": "Auto Route Command",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 800]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.webhook_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={{ {\n  \"command\": $json.command,\n  \"parameters\": $json.parameters,\n  \"auth_token\": $json.auth_token,\n  \"timestamp\": $json.timestamp,\n  \"request_id\": $json.request_id\n} }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "send-auto-command",
+      "name": "Send Auto Command",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1120, 800]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Enhanced Command Response Formatter\nconst commandInput = $input.all()[0].json;\nconst response = $input.all()[1]?.json || { error: 'No response received' };\n\nlet message;\nlet success = false;\n\nif (response.error) {\n  message = `❌ *Command Failed*\\n\\n🖥️ VPS: ${commandInput.vps_name}\\n🔧 Command: \\`${commandInput.command}\\`\\n\\n💥 Error: ${response.error}\\n\\n💡 *Tip:* VPS might be offline or command not supported.`;\n} else if (response.success === false) {\n  message = `❌ *Command Failed*\\n\\n🖥️ VPS: ${commandInput.vps_name}\\n🔧 Command: \\`${commandInput.command}\\`\\n\\n📝 Result:\\n\\`\\`\\`\\n${response.result || 'Unknown error'}\\n\\`\\`\\``;\n} else {\n  success = true;\n  let result = response.result || 'Command executed successfully';\n  \n  // Format JSON responses nicely\n  if (commandInput.command === 'system_status' && typeof result === 'string') {\n    try {\n      const parsed = JSON.parse(result);\n      result = `📊 *System Status*\\n` +\n              `💻 CPU: ${parsed.system_metrics?.cpu_percent || '?'}%\\n` +\n              `🧠 RAM: ${parsed.system_metrics?.memory_percent || '?'}%\\n` +\n              `💾 Disk: ${parsed.system_metrics?.disk_percent || '?'}%\\n` +\n              `⏱️ Uptime: ${parsed.uptime || '?'}\\n` +\n              `🌐 IP: ${parsed.network?.public_ip || '?'}\\n` +\n              `🎯 Gensyn: ${parsed.services?.gensyn_running ? '✅ Running' : '❌ Stopped'}\\n` +\n              `🔒 VPN: ${parsed.services?.vpn_active ? '✅ Active' : '❌ Inactive'}`;\n    } catch (e) {\n      // Keep original result if parsing fails\n    }\n  }\n  \n  // Truncate very long results\n  if (result.length > 1500) {\n    result = result.substring(0, 1500) + '\\n\\n... (truncated)';\n  }\n  \n  message = `✅ *Command Successful*\\n\\n🖥️ VPS: ${commandInput.vps_name}\\n🔧 Command: \\`${commandInput.command}\\`\\n\\n📝 Result:\\n${result.startsWith('📊') ? result : '```\\n' + result + '\\n```'}`;\n}\n\n// Add back button with enhanced navigation\nconst keyboard = [\n  [\n    { text: `🖥️ Back to ${commandInput.vps_name}`, callback_data: `select_vps_${commandInput.vps_id}` },\n    { text: \"📋 VPS List\", callback_data: \"show_vps_list\" }\n  ]\n];\n\n// Add quick action buttons for successful commands\nif (success && commandInput.command !== 'system_status') {\n  keyboard.unshift([\n    { text: \"📊 System Status\", callback_data: `cmd_${commandInput.vps_id}_system_status` },\n    { text: \"🔄 Refresh\", callback_data: `cmd_${commandInput.vps_id}_${commandInput.command}` }\n  ]);\n}\n\nreturn {\n  json: {\n    chat_id: commandInput.chat_id,\n    message: message,\n    parse_mode: \"Markdown\",\n    reply_markup: {\n      inline_keyboard: keyboard\n    },\n    success: success,\n    command: commandInput.command,\n    vps_name: commandInput.vps_name\n  }\n};"
+      },
+      "id": "format-auto-command-response",
+      "name": "Format Auto Command Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 800]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Admin VPS Management\nconst input = $input.all()[0].json;\nconst action = input.action;\nconst vpsId = input.selected_vps;\nconst workflowStaticData = this.getWorkflowStaticData('global');\n\nif (!workflowStaticData.vpsRegistry) {\n  workflowStaticData.vpsRegistry = {};\n}\n\nconst vpsRegistry = workflowStaticData.vpsRegistry;\n\nif (action === 'admin_approve_vps' || action === 'admin_reject_vps') {\n  const vpsData = vpsRegistry[vpsId];\n  if (!vpsData) {\n    return {\n      json: {\n        chat_id: input.chat_id,\n        message: `❌ VPS ${vpsId} not found`,\n        action: 'error'\n      }\n    };\n  }\n  \n  if (action === 'admin_approve_vps') {\n    vpsData.status = 'approved';\n    vpsData.approval_time = new Date().toISOString();\n    vpsData.approved_by = input.user_id;\n    \n    return {\n      json: {\n        chat_id: input.chat_id,\n        message: `✅ *VPS Approved*\\n\\n🖥️ **${vpsData.vps_name}** (\\`${vpsId}\\`) has been approved and is now available for management.\\n\\n🎯 Users can now access this VPS through the bot menu.`,\n        parse_mode: \"Markdown\",\n        action: 'approved',\n        vps_name: vpsData.vps_name\n      }\n    };\n  } else {\n    vpsData.status = 'rejected';\n    vpsData.rejection_time = new Date().toISOString();\n    vpsData.rejected_by = input.user_id;\n    \n    return {\n      json: {\n        chat_id: input.chat_id,\n        message: `❌ *VPS Rejected*\\n\\n🖥️ **${vpsData.vps_name}** (\\`${vpsId}\\`) has been rejected and will not appear in the user menu.\\n\\n🔄 The VPS can re-register if needed.`,\n        parse_mode: \"Markdown\",\n        action: 'rejected',\n        vps_name: vpsData.vps_name\n      }\n    };\n  }\n}\n\nif (action === 'admin_panel' || action === 'admin_vps_list') {\n  const allVpses = Object.entries(vpsRegistry).map(([id, data]) => {\n    const lastSeen = data.last_heartbeat ? new Date(data.last_heartbeat) : null;\n    const timeDiff = lastSeen ? Math.floor((Date.now() - lastSeen.getTime()) / 1000 / 60) : 999;\n    \n    return {\n      id,\n      name: data.vps_name,\n      status: data.status,\n      last_seen: timeDiff < 999 ? `${timeDiff}m ago` : 'never',\n      online: data.status === 'approved' && timeDiff < 10,\n      registration_time: data.registration_time,\n      system: data.system_info?.os || 'unknown'\n    };\n  }).sort((a, b) => a.name.localeCompare(b.name));\n  \n  const pending = allVpses.filter(v => v.status === 'pending_approval');\n  const approved = allVpses.filter(v => v.status === 'approved');\n  const rejected = allVpses.filter(v => v.status === 'rejected');\n  \n  let message = `⚙️ *Admin Panel*\\n\\n📊 **VPS Overview:**\\n• Total: ${allVpses.length}\\n• Approved: ${approved.length}\\n• Pending: ${pending.length}\\n• Rejected: ${rejected.length}\\n\\n`;\n  \n  if (pending.length > 0) {\n    message += `⏳ **Pending Approval:**\\n`;\n    pending.forEach(vps => {\n      message += `• ${vps.name} (${vps.system})\\n`;\n    });\n    message += `\\n`;\n  }\n  \n  if (approved.length > 0) {\n    message += `✅ **Approved VPSs:**\\n`;\n    approved.slice(0, 10).forEach(vps => {\n      const statusIcon = vps.online ? '🟢' : '🔴';\n      message += `• ${statusIcon} ${vps.name} (${vps.last_seen})\\n`;\n    });\n    if (approved.length > 10) {\n      message += `... and ${approved.length - 10} more\\n`;\n    }\n  }\n  \n  // Create admin keyboard\n  const keyboard = [];\n  \n  // Add pending VPS approval buttons\n  pending.slice(0, 3).forEach(vps => {\n    keyboard.push([\n      { text: `✅ Approve ${vps.name}`, callback_data: `approve_vps_${vps.id}` },\n      { text: `❌ Reject ${vps.name}`, callback_data: `reject_vps_${vps.id}` }\n    ]);\n  });\n  \n  // Add navigation buttons\n  keyboard.push([\n    { text: \"🔄 Refresh\", callback_data: \"admin_panel\" },\n    { text: \"📋 User Menu\", callback_data: \"show_vps_list\" }\n  ]);\n  \n  return {\n    json: {\n      chat_id: input.chat_id,\n      message: message,\n      parse_mode: \"Markdown\",\n      reply_markup: {\n        inline_keyboard: keyboard\n      },\n      action: 'admin_panel_displayed'\n    }\n  };\n}\n\nreturn {\n  json: {\n    chat_id: input.chat_id,\n    message: \"❌ Unknown admin action\",\n    action: 'error'\n  }\n};"
+      },
+      "id": "handle-admin-actions",
+      "name": "Handle Admin Actions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 900]
+    },
+    {
+      "parameters": {
+        "authentication": "accessToken",
+        "accessToken": "={{ $env.TELEGRAM_BOT_TOKEN }}",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "🤖 *Gensyn Auto-Discovery Manager*\\n\\n🆘 *Available Commands:*\\n\\n/start - Show available VPSs\\n/vpses - Show VPS list\\n/admin - Admin panel (admin only)\\n/help - Show this help\\n\\n🎯 *How it works:*\\n1. Run \\`auto_setup.py\\` on any VPS\\n2. VPS auto-registers with this server\\n3. Manage all VPSs from this single bot\\n\\n📖 *Features:*\\n• 🔄 **Auto-Discovery** - VPSs register automatically\\n• 📊 **Real-time Status** - Live system monitoring\\n• 🎛️ **Remote Control** - Manage Gensyn, VPN, and more\\n• 🔒 **Secure** - Token-based authentication\\n• ⚙️ **Admin Controls** - Approve/reject new VPSs\\n\\n💡 *Zero Configuration:* Just provide the n8n URL during VPS setup!",
+        "additionalFields": {
+          "parse_mode": "Markdown",
+          "reply_markup": {
+            "inline_keyboard": [
+              [
+                {
+                  "text": "📋 Show VPS List",
+                  "callback_data": "show_vps_list"
+                }
+              ]
+            ]
+          }
+        }
+      },
+      "id": "send-auto-help",
+      "name": "Send Auto Help",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [900, 1000]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "edit_message",
+              "leftValue": "={{ $json.edit_message }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equal"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "should-edit-auto-message",
+      "name": "Should Edit Auto Message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 600]
+    },
+    {
+      "parameters": {
+        "authentication": "accessToken",
+        "accessToken": "={{ $env.TELEGRAM_BOT_TOKEN }}",
+        "operation": "editMessage",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "parse_mode": "={{ $json.parse_mode }}",
+          "reply_markup": "={{ $json.reply_markup }}"
+        }
+      },
+      "id": "edit-auto-telegram-message",
+      "name": "Edit Auto Telegram Message",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [1340, 580]
+    },
+    {
+      "parameters": {
+        "authentication": "accessToken",
+        "accessToken": "={{ $env.TELEGRAM_BOT_TOKEN }}",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "parse_mode": "={{ $json.parse_mode }}",
+          "reply_markup": "={{ $json.reply_markup }}"
+        }
+      },
+      "id": "send-auto-telegram-message",
+      "name": "Send Auto Telegram Message",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [1340, 620]
+    }
+  ],
+  "connections": {
+    "VPS Registration Webhook": {
+      "main": [
+        [
+          {
+            "node": "Process VPS Registration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process VPS Registration": {
+      "main": [
+        [
+          {
+            "node": "Should Notify Admin?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Notify Admin?": {
+      "main": [
+        [
+          {
+            "node": "Notify Admin of Registration",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registration Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Admin of Registration": {
+      "main": [
+        [
+          {
+            "node": "Registration Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VPS Status Webhook": {
+      "main": [
+        [
+          {
+            "node": "Process Status Update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Status Update": {
+      "main": [
+        [
+          {
+            "node": "Should Alert Status?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Alert Status?": {
+      "main": [
+        [
+          {
+            "node": "Send Status Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Status Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Status Alert": {
+      "main": [
+        [
+          {
+            "node": "Status Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Bot": {
+      "main": [
+        [
+          {
+            "node": "Process Telegram Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Telegram Input": {
+      "main": [
+        [
+          {
+            "node": "Telegram Action Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Action Router": {
+      "main": [
+        [
+          {
+            "node": "Generate Auto VPS Menu",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Generate Enhanced VPS Controls",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Auto Route Command",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Auto Help",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Handle Admin Actions",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Handle Admin Actions",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Handle Admin Actions",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Handle Admin Actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Auto VPS Menu": {
+      "main": [
+        [
+          {
+            "node": "Should Edit Auto Message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Enhanced VPS Controls": {
+      "main": [
+        [
+          {
+            "node": "Should Edit Auto Message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Auto Route Command": {
+      "main": [
+        [
+          {
+            "node": "Send Auto Command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Auto Command": {
+      "main": [
+        [
+          {
+            "node": "Format Auto Command Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Auto Command Response": {
+      "main": [
+        [
+          {
+            "node": "Send Auto Telegram Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handle Admin Actions": {
+      "main": [
+        [
+          {
+            "node": "Send Auto Telegram Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Edit Auto Message?": {
+      "main": [
+        [
+          {
+            "node": "Edit Auto Telegram Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Auto Telegram Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 3,
+  "updatedAt": "2024-01-01T12:00:00.000Z",
+  "versionId": "2"
+}

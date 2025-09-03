@@ -1,0 +1,542 @@
+{
+  "meta": {
+    "instanceId": "gensyn-bot-multi-vps"
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "/webhook/gensyn/status",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-receiver",
+      "name": "VPS Status Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "gensyn-status-webhook"
+    },
+    {
+      "parameters": {
+        "authentication": "accessToken",
+        "accessToken": "={{ $env.TELEGRAM_BOT_TOKEN }}",
+        "updates": ["message", "callback_query"]
+      },
+      "id": "telegram-trigger",
+      "name": "Telegram Bot",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1,
+      "position": [240, 600]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate VPS webhook authentication and process message\nconst payload = $input.all()[0].json;\n\n// Expected auth tokens (store these securely in environment variables)\nconst expectedTokens = {\n  // Add your VPS tokens here - get them from each VPS webhook_config.json\n  // Format: \"vps-id\": \"auth-token\"\n  // Example: \"london-server\": \"abc123token\"\n};\n\nconst vpsId = payload.vps_id;\nconst receivedToken = payload.auth_token;\nconst messageType = payload.message_type;\n\n// Validate authentication\nif (!expectedTokens[vpsId] || expectedTokens[vpsId] !== receivedToken) {\n  return {\n    json: {\n      error: \"Invalid authentication\",\n      vps_id: vpsId,\n      status: 401\n    }\n  };\n}\n\n// Process different message types\nconst result = {\n  vps_id: vpsId,\n  vps_name: payload.vps_name,\n  timestamp: payload.timestamp,\n  message_type: messageType,\n  data: payload.data,\n  action: 'none'\n};\n\nswitch(messageType) {\n  case 'heartbeat':\n    result.action = 'update_heartbeat';\n    result.system_info = payload.data.system_info;\n    break;\n    \n  case 'notification':\n    result.action = 'process_notification';\n    result.priority = payload.data.priority;\n    result.notification_message = payload.data.message;\n    // Forward high priority notifications\n    if (payload.data.priority === 'high') {\n      result.send_alert = true;\n    }\n    break;\n    \n  case 'status_update':\n    result.action = 'update_status';\n    result.status_data = payload.data;\n    break;\n    \n  case 'reward_update':\n    result.action = 'send_reward_notification';\n    result.reward_message = payload.data.message;\n    break;\n    \n  case 'error_alert':\n    result.action = 'send_error_alert';\n    result.error_message = payload.data.error_message;\n    result.send_alert = true;\n    break;\n    \n  case 'command_response':\n    result.action = 'forward_command_response';\n    result.command = payload.data.command;\n    result.success = payload.data.success;\n    result.command_result = payload.data.result;\n    break;\n}\n\nreturn { json: result };"
+      },
+      "id": "process-webhook",
+      "name": "Process VPS Webhook",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Update VPS state in workflow static data\nconst input = $input.all()[0].json;\nconst workflowStaticData = this.getWorkflowStaticData('global');\n\n// Initialize VPS list if not exists\nif (!workflowStaticData.vpsList) {\n  workflowStaticData.vpsList = {};\n}\n\nconst vpsId = input.vps_id;\nconst now = new Date().toISOString();\n\n// Initialize VPS entry if not exists\nif (!workflowStaticData.vpsList[vpsId]) {\n  workflowStaticData.vpsList[vpsId] = {\n    name: input.vps_name,\n    status: 'unknown',\n    first_seen: now,\n    last_heartbeat: null,\n    last_status_update: null,\n    last_notification: null,\n    system_info: {}\n  };\n}\n\nconst vps = workflowStaticData.vpsList[vpsId];\nvps.name = input.vps_name; // Update name in case it changed\n\n// Update based on action type\nswitch(input.action) {\n  case 'update_heartbeat':\n    vps.status = 'online';\n    vps.last_heartbeat = input.timestamp;\n    vps.system_info = input.system_info || {};\n    break;\n    \n  case 'update_status':\n    vps.status = 'online';\n    vps.last_status_update = input.timestamp;\n    vps.status_data = input.status_data;\n    break;\n    \n  case 'process_notification':\n    vps.last_notification = input.timestamp;\n    break;\n}\n\n// Check if VPS should be marked offline (no heartbeat in 10 minutes)\nconst tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();\nif (vps.last_heartbeat && vps.last_heartbeat < tenMinutesAgo) {\n  vps.status = 'offline';\n}\n\n// Return updated state\nreturn {\n  json: {\n    vps_id: vpsId,\n    vps_state: vps,\n    all_vpses: workflowStaticData.vpsList,\n    action: input.action,\n    input: input\n  }\n};"
+      },
+      "id": "update-vps-state",
+      "name": "Update VPS State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "notification_alert",
+              "leftValue": "={{ $json.input.send_alert }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equal"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "should-send-alert",
+      "name": "Should Send Alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "authentication": "accessToken",
+        "accessToken": "={{ $env.TELEGRAM_BOT_TOKEN }}",
+        "chatId": "={{ $env.ADMIN_CHAT_ID }}",
+        "text": "🚨 *{{ $json.input.vps_name }}*\n\n{{ $json.input.notification_message || $json.input.error_message || $json.input.reward_message }}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "send-alert",
+      "name": "Send Alert to Admin",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [1120, 240]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "{\"status\": \"success\", \"message\": \"Webhook processed\"}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          }
+        }
+      },
+      "id": "webhook-response",
+      "name": "Webhook Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1120, 360]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process Telegram input (messages and callback queries)\nconst input = $input.all()[0].json;\nconst workflowStaticData = this.getWorkflowStaticData('global');\n\n// Initialize if needed\nif (!workflowStaticData.vpsList) {\n  workflowStaticData.vpsList = {};\n}\n\nconst vpsList = workflowStaticData.vpsList;\nconst isCallback = input.callback_query !== undefined;\nconst isMessage = input.message !== undefined;\n\nlet chatId, messageText, callbackData, userId;\n\nif (isCallback) {\n  chatId = input.callback_query.message.chat.id;\n  callbackData = input.callback_query.data;\n  userId = input.callback_query.from.id;\n  messageText = callbackData;\n} else if (isMessage) {\n  chatId = input.message.chat.id;\n  messageText = input.message.text;\n  userId = input.message.from.id;\n}\n\n// Parse command/action\nlet action = 'unknown';\nlet selectedVps = null;\nlet command = null;\n\nif (messageText) {\n  if (messageText === '/start' || messageText === '/vpses') {\n    action = 'show_vps_list';\n  } else if (messageText === '/help') {\n    action = 'show_help';\n  } else if (messageText.startsWith('select_vps_')) {\n    action = 'vps_selected';\n    selectedVps = messageText.replace('select_vps_', '');\n  } else if (messageText.startsWith('cmd_')) {\n    const parts = messageText.split('_');\n    if (parts.length >= 3) {\n      action = 'execute_command';\n      selectedVps = parts[1];\n      command = parts.slice(2).join('_');\n    }\n  } else if (messageText === 'back_to_vps_list') {\n    action = 'show_vps_list';\n  }\n}\n\n// Generate VPS list for display\nconst vpsArray = Object.entries(vpsList).map(([id, data]) => {\n  const status = data.status === 'online' ? '🟢' : '🔴';\n  const lastSeen = data.last_heartbeat ? new Date(data.last_heartbeat) : null;\n  const timeDiff = lastSeen ? Math.floor((Date.now() - lastSeen.getTime()) / 1000 / 60) : 999;\n  \n  return {\n    id: id,\n    name: data.name,\n    status: status,\n    display: `${status} ${data.name} (${timeDiff < 999 ? timeDiff + 'm ago' : 'offline'})`,\n    online: data.status === 'online' && timeDiff < 10,\n    last_seen_minutes: timeDiff\n  };\n}).sort((a, b) => a.name.localeCompare(b.name));\n\nreturn {\n  json: {\n    action: action,\n    chat_id: chatId,\n    user_id: userId,\n    message_text: messageText,\n    selected_vps: selectedVps,\n    command: command,\n    vps_list: vpsArray,\n    callback_data: callbackData,\n    is_callback: isCallback\n  }\n};"
+      },
+      "id": "process-telegram",
+      "name": "Process Telegram Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 600]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "show_vps_list",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "show_vps_list",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "vps_selected",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "vps_selected",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "execute_command",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "execute_command",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "show_help",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "show_help",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "id": "telegram-router",
+      "name": "Telegram Action Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [680, 600]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Generate VPS selection menu\nconst input = $input.all()[0].json;\nconst vpsList = input.vps_list;\n\nif (vpsList.length === 0) {\n  return {\n    json: {\n      chat_id: input.chat_id,\n      message: \"🤖 *Gensyn Multi-VPS Manager*\\n\\n❌ No VPSs currently available.\\n\\nPlease ensure your VPS bots are running and configured with the correct webhook URL.\",\n      parse_mode: \"Markdown\",\n      reply_markup: null\n    }\n  };\n}\n\n// Create inline keyboard with VPS options\nconst keyboard = vpsList.map(vps => [{\n  text: vps.display,\n  callback_data: `select_vps_${vps.id}`\n}]);\n\n// Add refresh button\nkeyboard.push([{\n  text: \"🔄 Refresh\",\n  callback_data: \"show_vps_list\"\n}]);\n\nconst totalVpses = vpsList.length;\nconst onlineVpses = vpsList.filter(v => v.online).length;\n\nreturn {\n  json: {\n    chat_id: input.chat_id,\n    message: `🤖 *Gensyn Multi-VPS Manager*\\n\\n📊 Status: ${onlineVpses}/${totalVpses} VPSs online\\n\\n🖥️ Select a VPS to manage:`,\n    parse_mode: \"Markdown\",\n    reply_markup: {\n      inline_keyboard: keyboard\n    },\n    edit_message: input.is_callback\n  }\n};"
+      },
+      "id": "generate-vps-menu",
+      "name": "Generate VPS Menu",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Generate VPS management menu\nconst input = $input.all()[0].json;\nconst vpsId = input.selected_vps;\nconst vpsList = input.vps_list;\n\n// Find the selected VPS\nconst selectedVps = vpsList.find(v => v.id === vpsId);\n\nif (!selectedVps) {\n  return {\n    json: {\n      chat_id: input.chat_id,\n      message: \"❌ VPS not found. Please try again.\",\n      reply_markup: {\n        inline_keyboard: [[\n          { text: \"⬅️ Back to VPS List\", callback_data: \"show_vps_list\" }\n        ]]\n      }\n    }\n  };\n}\n\n// Get VPS details from static data\nconst workflowStaticData = this.getWorkflowStaticData('global');\nconst vpsData = workflowStaticData.vpsList[vpsId] || {};\n\n// Build status info\nconst statusIcon = selectedVps.online ? '🟢' : '🔴';\nconst statusText = selectedVps.online ? 'Online' : 'Offline';\nconst lastSeen = selectedVps.last_seen_minutes < 999 ? `${selectedVps.last_seen_minutes}m ago` : 'unknown';\n\n// System info if available\nlet systemInfo = '';\nif (vpsData.system_info && Object.keys(vpsData.system_info).length > 0) {\n  const sys = vpsData.system_info;\n  systemInfo = `\\n💻 CPU: ${sys.cpu_percent || '?'}% | RAM: ${sys.memory_percent || '?'}% | Disk: ${sys.disk_percent || '?'}%`;\n}\n\n// Create command buttons\nconst keyboard = [\n  [\n    { text: \"📊 Status\", callback_data: `cmd_${vpsId}_gensyn_status` },\n    { text: \"🌐 Check IP\", callback_data: `cmd_${vpsId}_check_ip` }\n  ],\n  [\n    { text: \"▶️ Start Gensyn\", callback_data: `cmd_${vpsId}_start_gensyn` },\n    { text: \"⏹️ Stop Gensyn\", callback_data: `cmd_${vpsId}_kill_gensyn` }\n  ],\n  [\n    { text: \"🔒 VPN On\", callback_data: `cmd_${vpsId}_vpn_on` },\n    { text: \"🔓 VPN Off\", callback_data: `cmd_${vpsId}_vpn_off` }\n  ],\n  [\n    { text: \"📋 Logs\", callback_data: `cmd_${vpsId}_get_logs` },\n    { text: \"🔄 Update\", callback_data: `cmd_${vpsId}_soft_update` }\n  ],\n  [\n    { text: \"⬅️ Back to VPS List\", callback_data: \"show_vps_list\" }\n  ]\n];\n\nreturn {\n  json: {\n    chat_id: input.chat_id,\n    message: `🖥️ *${selectedVps.name} Management*\\n\\n📊 Status: ${statusIcon} ${statusText} (${lastSeen})${systemInfo}\\n\\n🎛️ Choose an action:`,\n    parse_mode: \"Markdown\",\n    reply_markup: {\n      inline_keyboard: keyboard\n    },\n    edit_message: input.is_callback\n  }\n};"
+      },
+      "id": "generate-vps-controls",
+      "name": "Generate VPS Controls",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 600]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Route command to VPS\nconst input = $input.all()[0].json;\nconst vpsId = input.selected_vps;\nconst command = input.command;\n\n// VPS webhook configurations (add your VPS details here)\nconst vpsConfigs = {\n  // Format: \"vps-id\": { \"webhook_url\": \"http://vps-ip:port/webhook/command\", \"auth_token\": \"token\" }\n  // Example:\n  // \"london-server\": {\n  //   \"webhook_url\": \"http://192.168.1.100:8080/webhook/command\",\n  //   \"auth_token\": \"your-london-server-token\"\n  // }\n};\n\nconst config = vpsConfigs[vpsId];\nif (!config) {\n  return {\n    json: {\n      error: `VPS configuration not found for ${vpsId}`,\n      chat_id: input.chat_id,\n      vps_id: vpsId\n    }\n  };\n}\n\n// Prepare command parameters based on command type\nlet parameters = {};\nif (command === 'get_logs') {\n  parameters = { log_type: 'gensyn', lines: 20 };\n} else if (command === 'start_gensyn') {\n  parameters = { use_sync_backup: true, fresh_start: false };\n}\n\n// Prepare command payload\nconst commandPayload = {\n  command: command,\n  parameters: parameters,\n  auth_token: config.auth_token,\n  timestamp: new Date().toISOString(),\n  request_id: `${vpsId}-${Date.now()}`\n};\n\nreturn {\n  json: {\n    ...commandPayload,\n    webhook_url: config.webhook_url,\n    chat_id: input.chat_id,\n    vps_id: vpsId,\n    vps_name: input.vps_list.find(v => v.id === vpsId)?.name || vpsId\n  }\n};"
+      },
+      "id": "route-command",
+      "name": "Route Command to VPS",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 700]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.webhook_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={{ {\\n  \\\"command\\\": $json.command,\\n  \\\"parameters\\\": $json.parameters,\\n  \\\"auth_token\\\": $json.auth_token,\\n  \\\"timestamp\\\": $json.timestamp,\\n  \\\"request_id\\\": $json.request_id\\n} }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "send-command",
+      "name": "Send Command to VPS",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1120, 700]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process command response and format for Telegram\nconst commandInput = $input.all()[0].json;\nconst response = $input.all()[1]?.json || { error: 'No response received' };\n\nlet message;\nlet success = false;\n\nif (response.error) {\n  message = `❌ *Command Failed*\\n\\n🖥️ VPS: ${commandInput.vps_name}\\n🔧 Command: \\`${commandInput.command}\\`\\n\\n💥 Error: ${response.error}`;\n} else if (response.success === false) {\n  message = `❌ *Command Failed*\\n\\n🖥️ VPS: ${commandInput.vps_name}\\n🔧 Command: \\`${commandInput.command}\\`\\n\\n📝 Result:\\n\\`\\`\\`\\n${response.result || 'Unknown error'}\\n\\`\\`\\``;\n} else {\n  success = true;\n  let result = response.result || 'Command executed successfully';\n  \n  // Truncate very long results\n  if (result.length > 1000) {\n    result = result.substring(0, 1000) + '\\n\\n... (truncated)';\n  }\n  \n  message = `✅ *Command Successful*\\n\\n🖥️ VPS: ${commandInput.vps_name}\\n🔧 Command: \\`${commandInput.command}\\`\\n\\n📝 Result:\\n\\`\\`\\`\\n${result}\\n\\`\\`\\``;\n}\n\n// Add back button\nconst keyboard = [[\n  { text: `🖥️ Back to ${commandInput.vps_name}`, callback_data: `select_vps_${commandInput.vps_id}` },\n  { text: \"📋 VPS List\", callback_data: \"show_vps_list\" }\n]];\n\nreturn {\n  json: {\n    chat_id: commandInput.chat_id,\n    message: message,\n    parse_mode: \"Markdown\",\n    reply_markup: {\n      inline_keyboard: keyboard\n    },\n    success: success,\n    command: commandInput.command,\n    vps_name: commandInput.vps_name\n  }\n};"
+      },
+      "id": "format-command-response",
+      "name": "Format Command Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 700]
+    },
+    {
+      "parameters": {
+        "authentication": "accessToken",
+        "accessToken": "={{ $env.TELEGRAM_BOT_TOKEN }}",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "🤖 *Gensyn Multi-VPS Manager*\\n\\n🆘 *Available Commands:*\\n\\n/start - Show VPS list\\n/vpses - Show VPS list\\n/help - Show this help\\n\\n🎯 *How to use:*\\n1. Use /start to see available VPSs\\n2. Select a VPS to manage\\n3. Choose actions from the menu\\n\\n📖 *Available Actions:*\\n• 📊 Status - Get Gensyn status\\n• 🌐 Check IP - Get current IP\\n• ▶️ Start Gensyn - Start the node\\n• ⏹️ Stop Gensyn - Stop the node\\n• 🔒 VPN On/Off - Manage VPN\\n• 📋 Logs - View recent logs\\n• 🔄 Update - Update Gensyn\\n\\n💡 Each VPS is managed independently through this single bot interface.",
+        "additionalFields": {
+          "parse_mode": "Markdown",
+          "reply_markup": {
+            "inline_keyboard": [
+              [
+                {
+                  "text": "📋 Show VPS List",
+                  "callback_data": "show_vps_list"
+                }
+              ]
+            ]
+          }
+        }
+      },
+      "id": "send-help",
+      "name": "Send Help Message",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [900, 800]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "edit_message",
+              "leftValue": "={{ $json.edit_message }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equal"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "should-edit-message",
+      "name": "Should Edit Message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 500]
+    },
+    {
+      "parameters": {
+        "authentication": "accessToken",
+        "accessToken": "={{ $env.TELEGRAM_BOT_TOKEN }}",
+        "operation": "editMessage",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "parse_mode": "={{ $json.parse_mode }}",
+          "reply_markup": "={{ $json.reply_markup }}"
+        }
+      },
+      "id": "edit-telegram-message",
+      "name": "Edit Telegram Message",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [1340, 480]
+    },
+    {
+      "parameters": {
+        "authentication": "accessToken",
+        "accessToken": "={{ $env.TELEGRAM_BOT_TOKEN }}",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "parse_mode": "={{ $json.parse_mode }}",
+          "reply_markup": "={{ $json.reply_markup }}"
+        }
+      },
+      "id": "send-telegram-message",
+      "name": "Send Telegram Message",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [1340, 520]
+    }
+  ],
+  "connections": {
+    "VPS Status Webhook": {
+      "main": [
+        [
+          {
+            "node": "Process VPS Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process VPS Webhook": {
+      "main": [
+        [
+          {
+            "node": "Update VPS State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update VPS State": {
+      "main": [
+        [
+          {
+            "node": "Should Send Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Send Alert?": {
+      "main": [
+        [
+          {
+            "node": "Send Alert to Admin",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Webhook Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Alert to Admin": {
+      "main": [
+        [
+          {
+            "node": "Webhook Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Bot": {
+      "main": [
+        [
+          {
+            "node": "Process Telegram Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Telegram Input": {
+      "main": [
+        [
+          {
+            "node": "Telegram Action Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Action Router": {
+      "main": [
+        [
+          {
+            "node": "Generate VPS Menu",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Generate VPS Controls",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Route Command to VPS",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Help Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate VPS Menu": {
+      "main": [
+        [
+          {
+            "node": "Should Edit Message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate VPS Controls": {
+      "main": [
+        [
+          {
+            "node": "Should Edit Message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Command to VPS": {
+      "main": [
+        [
+          {
+            "node": "Send Command to VPS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Command to VPS": {
+      "main": [
+        [
+          {
+            "node": "Format Command Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Command Response": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Edit Message?": {
+      "main": [
+        [
+          {
+            "node": "Edit Telegram Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Telegram Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 2,
+  "updatedAt": "2024-01-01T12:00:00.000Z",
+  "versionId": "1"
+}
+
