@@ -49,7 +49,7 @@ I've completely redesigned the Gensyn Bot system to be **100% automated** and **
 #### **VPS Setup (Per VPS)**
 ```bash
 # One-line installation
-curl -sSL https://your-repo/auto_install.sh | bash
+curl -sSL [https://github.com/shairkhan675/gensyn-bot/auto_install.sh | bash
 
 # Two questions only:
 # 1. n8n server URL
@@ -288,3 +288,4 @@ The automated Gensyn Bot system is now **production-ready** and **perfect for no
 ...delivers exactly what was requested: **a seamless, automated system that non-technical people can use effortlessly**.
 
 **🎯 Mission: ACCOMPLISHED!** 🎉
+
